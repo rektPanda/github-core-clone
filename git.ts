@@ -47,7 +47,9 @@ export function isObjectId(value: string): boolean {
 
 /** git's object id: SHA-1 over `<type> <size>\0` + the object's bytes. */
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
-  const body = Buffer.from(data);
+  // The callers already hold a Buffer (inflate output, built objects): hashing it in place
+  // avoids a full copy per object.
+  const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
   hash.update(Buffer.from(`${type} ${body.length}\u0000`, 'utf8'));
   hash.update(body);
@@ -123,7 +125,27 @@ export function pktDataLines(bytes: Uint8Array): string[] {
 // trees, commits, tags
 // --------------------------------------------------------------------------------------------
 
+/**
+ * Parsed views of immutable objects, cached by the object's own bytes. Commits, trees and
+ * tags never change once stored, so a parse is a pure function of the bytes: the same
+ * Buffer always parses to the same view. The fetch/clone/merge paths re-parse the same
+ * commits and trees over and over (one parse per ancestor step per walk); the cache turns
+ * every repeat into a map lookup. A WeakMap keeps the cache's lifetime tied to the object
+ * bytes themselves, so nothing can leak and nothing can go stale.
+ */
+const commitViewCache = new WeakMap<Uint8Array, CommitView>();
+const treeViewCache = new WeakMap<Uint8Array, TreeEntry[]>();
+const tagViewCache = new WeakMap<Uint8Array, TagView>();
+
 export function parseTree(data: Uint8Array): TreeEntry[] {
+  const cached = treeViewCache.get(data);
+  if (cached !== undefined) return cached;
+  const parsed = parseTreeFresh(data);
+  treeViewCache.set(data, parsed);
+  return parsed;
+}
+
+function parseTreeFresh(data: Uint8Array): TreeEntry[] {
   const buffer = Buffer.from(data);
   const entries: TreeEntry[] = [];
   let offset = 0;
@@ -160,6 +182,14 @@ export function buildTree(entries: ReadonlyArray<TreeEntry>): Buffer {
 }
 
 export function parseCommit(data: Uint8Array): CommitView {
+  const cached = commitViewCache.get(data);
+  if (cached !== undefined) return cached;
+  const parsed = parseCommitFresh(data);
+  commitViewCache.set(data, parsed);
+  return parsed;
+}
+
+function parseCommitFresh(data: Uint8Array): CommitView {
   const buffer = Buffer.from(data);
   const blank = buffer.indexOf('\n\n');
   const headerEnd = blank < 0 ? buffer.length : blank;
@@ -184,6 +214,14 @@ export function parseCommit(data: Uint8Array): CommitView {
 }
 
 export function parseTag(data: Uint8Array): TagView {
+  const cached = tagViewCache.get(data);
+  if (cached !== undefined) return cached;
+  const parsed = parseTagFresh(data);
+  tagViewCache.set(data, parsed);
+  return parsed;
+}
+
+function parseTagFresh(data: Uint8Array): TagView {
   const buffer = Buffer.from(data);
   const blank = buffer.indexOf('\n\n');
   const headerEnd = blank < 0 ? buffer.length : blank;
@@ -427,7 +465,9 @@ export function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
 
 /** Read a packfile (version 2 or 3) and resolve every object, including OFS/REF deltas. */
 export function readPack(pack: Uint8Array, options: { resolveBase?: ObjectLookup } = {}): Map<string, GitObject> {
-  const buffer = Buffer.from(pack);
+  // The caller hands over a Buffer already (a subarray of the request body): hashing and
+  // slicing it in place avoids copying the whole pack per push.
+  const buffer = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
   if (buffer.length < 32) throw new Error(`pack is ${buffer.length} bytes, too short`);
   if (buffer.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
   const version = buffer.readUInt32BE(4);

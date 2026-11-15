@@ -495,7 +495,9 @@ export class Store {
         // A have the server cannot resolve is ignored.
       }
     }
-    // BFS from the wants, tracking commit depth from the nearest want.
+    // BFS from the wants, tracking commit depth from the nearest want. The queue is drained
+    // by index, not shift(): shift() re-indexes the whole array on every pop, which is
+    // quadratic over a large walk (a full-history fetch of hundreds of commits).
     const wanted = new Set<string>();
     const shallow: string[] = [];
     const commitDepth = new Map<string, number>();
@@ -507,8 +509,8 @@ export class Store {
         queue.push({ oid: want, depth: 0 });
       }
     }
-    while (queue.length > 0) {
-      const { oid, depth: d } = queue.shift()!;
+    for (let head = 0; head < queue.length; head += 1) {
+      const { oid, depth: d } = queue[head]!;
       const object = repo.objects.get(oid);
       if (object === undefined) continue;
       // Every object the walk reaches is delivered (minus what the client holds).

