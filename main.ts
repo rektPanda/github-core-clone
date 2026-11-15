@@ -14,9 +14,14 @@
 //   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// main.ts imports its own server plus the node:http/https built-ins for the env calls, and nothing
+// else: no package, no model call. The env calls deliberately avoid fetch(): Node 22 fetch() routes
+// through EnvHttpProxyAgent, so a sandbox HTTP(S)_PROXY/no_proxy can swallow register/done forever
+// and the trial dies at the wall with working 0. A raw http.request ignores the proxy env entirely.
 
 import { createApp } from './app.ts';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -24,8 +29,8 @@ if (ENV_URL === '') {
   process.exit(1);
 }
 try {
-  // Fail fast on a malformed env origin: fetch would throw on every register and poll
-  // attempt and the process would only spin until the trial wall, so say so at once.
+  // Fail fast on a malformed env origin: every register and poll attempt would fail on it
+  // and the process would only spin until the trial wall, so say so at once.
   new URL(ENV_URL);
 } catch {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not a valid URL; cannot reach the env\n');
@@ -46,23 +51,51 @@ function retryDelay(attempt: number): number {
 }
 
 /**
+ * One env request over a raw socket, no proxy: node:http(s) never reads HTTP_PROXY,
+ * HTTPS_PROXY or no_proxy, so the call always goes straight to the env origin. Same
+ * 30 s timeout per request as fetch() had before; a timeout destroys the request.
+ */
+function envRequest(path: string, method: string, body?: string): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(ENV_URL + path);
+    const secure = url.protocol === 'https:';
+    const req = (secure ? httpsRequest : httpRequest)(
+      {
+        hostname: url.hostname,
+        port: url.port ? Number(url.port) : secure ? 443 : 80,
+        path: url.pathname + url.search,
+        method,
+        headers: body !== undefined ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {},
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') }));
+      },
+    );
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => req.destroy(new Error(`env request ${method} ${path} timed out after ${REQUEST_TIMEOUT_MS}ms`)));
+    req.on('error', reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+/**
  * POST the bound port until the env accepts it. 200 is the normal answer; 409 means a first register
  * already won, which is not this process's to fix. 400 and 405 are contract errors and end the program;
- * a network error or another status is retried, since the env may still be starting.
+ * a network error or another status is retried, since the env may still be starting. Every failed
+ * attempt is logged to stderr with its attempt number, so a stuck register is visible in the trial log.
  */
 async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+      const res = await envRequest('/register', 'POST', JSON.stringify({ port }));
       if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
+      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${res.text}`);
+      process.stderr.write(`[entry] register attempt ${attempt + 1} failed: HTTP ${res.status}\n`);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
+      process.stderr.write(`[entry] register attempt ${attempt + 1} failed: ${err instanceof Error ? err.message : String(err)}\n`);
     }
     await sleep(retryDelay(attempt));
   }
@@ -72,9 +105,9 @@ async function register(port: number): Promise<void> {
 async function waitForDone(): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
+      const res = await envRequest('/done', 'GET');
+      if (res.status >= 200 && res.status < 300) {
+        const body = JSON.parse(res.text) as { done?: unknown };
         if (body.done === true) return;
       }
     } catch {
